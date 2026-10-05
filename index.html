@@ -31,8 +31,8 @@
         <div>
           <h1 class="font-bold text-lg leading-tight">Controle de Notas</h1>
           <p class="text-xs text-slate-400 flex items-center gap-1">
-            <span class="w-2 h-2 rounded-full bg-emerald-500 inline-block animate-pulse"></span>
-            <span>Sincronizado ao vivo</span>
+            <span id="status-indicator" class="w-2 h-2 rounded-full bg-emerald-500 inline-block animate-pulse"></span>
+            <span id="status-text">Sincronizado ao vivo</span>
           </p>
         </div>
       </div>
@@ -98,13 +98,13 @@
       </div>
       <form id="invoice-form" onsubmit="handleFormSubmit(event)" class="space-y-4 mt-4">
         <div>
-          <label class="block text-xs font-semibold text-slate-600 uppercase mb-1">Foto da Nota</label>
+          <label class="block text-xs font-semibold text-slate-600 uppercase mb-1">Foto da Nota (Opcional)</label>
           <input type="file" id="photo-input" accept="image/*" capture="environment" onchange="processImage(event)" class="w-full text-xs">
           <img id="photo-preview" class="hidden max-h-32 mt-2 rounded border">
         </div>
         <div class="grid grid-cols-2 gap-3">
           <div>
-            <label class="block text-xs font-semibold mb-1">Nº NF (sem zeros)</label>
+            <label class="block text-xs font-semibold mb-1">Nº NF</label>
             <input type="text" id="nf-number" required placeholder="1234" class="w-full border rounded p-2 text-sm">
           </div>
           <div>
@@ -122,53 +122,84 @@
         </div>
         <div class="flex gap-2 pt-2">
           <button type="button" onclick="closeAddModal()" class="w-1/2 py-2 text-slate-600 font-semibold text-sm">Cancelar</button>
-          <button type="submit" class="w-1/2 bg-indigo-600 text-white font-semibold text-sm py-2 rounded-xl">Salvar Nota</button>
+          <button type="submit" id="save-btn" class="w-1/2 bg-indigo-600 text-white font-semibold text-sm py-2 rounded-xl">Salvar Nota</button>
         </div>
       </form>
     </div>
   </div>
 
   <script>
-    // Configuração do Banco em Tempo Real
+    // Configuração do Firebase
     const firebaseConfig = { databaseURL: "https://controle-notas-default-rtdb.firebaseio.com" };
     if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
     const db = firebase.database();
 
     let currentRoom = localStorage.getItem('invoice_room') || 'PRINCIPAL';
+    document.getElementById('current-room-label').innerText = `Sala: ${currentRoom}`;
     let invoices = {};
     let currentPhotoBase64 = '';
 
-    // Escutar atualizações ao vivo do outro celular
+    // Escutar atualizações ao vivo
     function listenRealtimeData() {
       db.ref('rooms/' + currentRoom).on('value', (snapshot) => {
         invoices = snapshot.val() || {};
         renderInvoices();
         updateStats();
+      }, (error) => {
+        console.error("Erro no Firebase:", error);
+        alert("Erro de conexão com o banco de dados. Verifique a permissão do Firebase.");
       });
     }
     listenRealtimeData();
 
-    // Processar Foto
+    // Compressão simples de imagem para evitar estourar limite do banco
     function processImage(e) {
       const file = e.target.files[0];
       if (!file) return;
+
       const reader = new FileReader();
       reader.onload = (evt) => {
-        currentPhotoBase64 = evt.target.result;
-        document.getElementById('photo-preview').src = currentPhotoBase64;
-        document.getElementById('photo-preview').classList.remove('hidden');
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          const maxDim = 600;
+          let width = img.width;
+          let height = img.height;
+
+          if (width > height) {
+            if (width > maxDim) { height *= maxDim / width; width = maxDim; }
+          } else {
+            if (height > maxDim) { width *= maxDim / height; height = maxDim; }
+          }
+
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, width, height);
+
+          currentPhotoBase64 = canvas.toDataURL('image/jpeg', 0.6);
+          document.getElementById('photo-preview').src = currentPhotoBase64;
+          document.getElementById('photo-preview').classList.remove('hidden');
+        };
+        img.src = evt.target.result;
       };
       reader.readAsDataURL(file);
     }
 
-    // Salvar e Enviar
+    // Salvar no Banco
     function handleFormSubmit(e) {
       e.preventDefault();
-      const rawNf = document.getElementById('nf-number').value.trim();
-      const cleanNf = rawNf.replace(/^0+/, '') || '0'; // Remove zeros à esquerda automaticamente
+      
+      const saveBtn = document.getElementById('save-btn');
+      saveBtn.disabled = true;
+      saveBtn.innerText = 'Salvando...';
 
+      const rawNf = document.getElementById('nf-number').value.trim();
+      const cleanNf = rawNf.replace(/^0+/, '') || '0';
+
+      const invoiceId = 'nf_' + Date.now();
       const newInvoice = {
-        id: Date.now().toString(),
+        id: invoiceId,
         number: cleanNf,
         value: parseFloat(document.getElementById('nf-value').value) || 0,
         supplier: document.getElementById('nf-supplier').value.trim(),
@@ -179,41 +210,52 @@
         createdAt: new Date().toISOString()
       };
 
-      db.ref(`rooms/${currentRoom}/${newInvoice.id}`).set(newInvoice);
-      closeAddModal();
+      db.ref(`rooms/${currentRoom}/${invoiceId}`).set(newInvoice)
+        .then(() => {
+          closeAddModal();
+          saveBtn.disabled = false;
+          saveBtn.innerText = 'Salvar Nota';
+        })
+        .catch((err) => {
+          alert('Erro ao salvar no banco: ' + err.message);
+          saveBtn.disabled = false;
+          saveBtn.innerText = 'Salvar Nota';
+        });
     }
 
-    // Alternar Botões de Liberação
+    // Alternar Liberação
     function toggleStatus(id, type) {
       if (!invoices[id]) return;
       const newStatus = invoices[id][type] === 'OK' ? 'PENDENTE' : 'OK';
       db.ref(`rooms/${currentRoom}/${id}/${type}`).set(newStatus);
     }
 
-    // Renderizar Lista na Tela
+    // Renderizar na Tela
     function renderInvoices() {
       const container = document.getElementById('invoices-container');
       const list = Object.values(invoices);
+
       if (list.length === 0) {
-        container.innerHTML = `<p class="col-span-2 text-center text-slate-400 py-8">Nenhuma nota cadastrada nesta sala.</p>`;
+        container.innerHTML = `<p class="col-span-2 text-center text-slate-400 py-12 bg-white rounded-2xl border border-dashed border-slate-300">Nenhuma nota cadastrada nesta sala.</p>`;
         return;
       }
+
       container.innerHTML = list.map(item => `
         <div class="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col justify-between">
-          <div class="flex justify-between items-start">
-            <div class="flex gap-3">
-              ${item.photo ? `<img src="${item.photo}" class="w-12 h-12 object-cover rounded-lg border">` : ''}
+          <div class="flex justify-between items-start gap-2">
+            <div class="flex gap-3 items-center">
+              ${item.photo ? `<img src="${item.photo}" class="w-12 h-12 object-cover rounded-lg border">` : '<div class="w-12 h-12 bg-slate-100 rounded-lg flex items-center justify-center text-slate-400"><i class="fa-solid fa-file-invoice"></i></div>'}
               <div>
                 <span class="text-xs font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded">NF nº ${item.number}</span>
                 <h4 class="font-bold text-slate-800 text-sm mt-1">${item.supplier}</h4>
                 <p class="text-xs text-slate-400">Data: ${item.date ? item.date.split('-').reverse().join('/') : '-'}</p>
               </div>
             </div>
-            <p class="font-black text-slate-900">R$ ${item.value.toLocaleString('pt-BR', {minimumFractionDigits: 2})}</p>
+            <p class="font-black text-slate-900 text-right">R$ ${(item.value || 0).toLocaleString('pt-BR', {minimumFractionDigits: 2})}</p>
           </div>
           <div class="grid grid-cols-2 gap-2 mt-4 pt-3 border-t">
-            <button onclick="toggleStatus('${item.id}', 'vmarket')" class="py-2 rounded-xl font-bold text-xs ${item.vmarket === 'OK' ? 'status-ok' : 'bg-slate-100 text-slate-500'}">VMARKET: ${item.vmarket}</button>
-            <button onclick="toggleStatus('${item.id}', 'everloja')" class="py-2 rounded-xl font-bold text-xs ${item.everloja === 'OK' ? 'status-ok' : 'bg-slate-100 text-slate-500'}">EVERLOJA: ${item.everloja}</button>
+            <button onclick="toggleStatus('${item.id}', 'vmarket')" class="py-2 rounded-xl font-bold text-xs transition ${item.vmarket === 'OK' ? 'status-ok' : 'bg-slate-100 text-slate-500'}">VMARKET: ${item.vmarket}</button>
+            <button onclick="toggleStatus('${item.id}', 'everloja')" class="py-2 rounded-xl font-bold text-xs transition ${item.everloja === 'OK' ? 'status-ok' : 'bg-slate-100 text-slate-500'}">EVERLOJA: ${item.everloja}</button>
           </div>
         </div>
       `).join('');
@@ -229,7 +271,7 @@
       document.getElementById('stat-pending-count').innerText = pendingCount;
     }
 
-    // Gerar PDF para Gestor
+    // Gerar PDF
     function exportToPDF() {
       const { jsPDF } = window.jspdf;
       const doc = new jsPDF();
@@ -245,7 +287,7 @@
         i.number,
         i.supplier,
         i.date ? i.date.split('-').reverse().join('/') : '-',
-        `R$ ${i.value.toLocaleString('pt-BR', {minimumFractionDigits: 2})}`,
+        `R$ ${(i.value || 0).toLocaleString('pt-BR', {minimumFractionDigits: 2})}`,
         `VMARKET: ${i.vmarket}\nEVERLOJA: ${i.everloja}`
       ]);
 
@@ -261,12 +303,15 @@
 
     // Resetar Mês
     function confirmResetMonth() {
-      if (confirm(`Deseja apagar todas as notas da Sala ${currentRoom}?`)) db.ref(`rooms/${currentRoom}`).remove();
+      if (confirm(`Deseja apagar todas as notas da Sala ${currentRoom}?`)) {
+        db.ref(`rooms/${currentRoom}`).remove();
+      }
     }
 
     // Modais
     function openAddModal() { 
       document.getElementById('invoice-form').reset();
+      currentPhotoBase64 = '';
       document.getElementById('photo-preview').classList.add('hidden');
       document.getElementById('add-modal').classList.remove('hidden'); 
     }
